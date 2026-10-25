@@ -1,0 +1,790 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { OperationResultCache } from "@/lib/edge/analytics/application/cache";
+import {
+  AnalyticsProviderRegistry,
+  createTypedQueryProviderRegistry,
+  typedQueryProviderFor,
+} from "@/lib/edge/analytics/application/provider-registry";
+import {
+  type AnalyticsQueryEvent,
+  TypedQueryApplicationService,
+} from "@/lib/edge/analytics/application/service";
+import {
+  createQueryTime,
+  EMPTY_FILTER_DOCUMENT,
+  type OverviewQuery,
+  type OverviewReader,
+  type QueryContext,
+  type QueryOperation,
+  siteQueryContext,
+} from "@/lib/edge/analytics/contract";
+import { analyticsFilterRegistry, parseFilterDsl } from "@/lib/filter-contract";
+import { InvalidCursorError } from "@/lib/pagination";
+
+const time = createQueryTime(1_000, 2_000, "UTC", 2_000);
+const overviewValue = (views: number) => ({
+  current: {
+    views,
+    sessions: 1,
+    visitors: 1,
+    bounces: 0,
+    totalDurationMs: 0,
+    durationViews: 0,
+  },
+});
+
+function reader(): OverviewReader {
+  return {
+    readOverview: vi.fn().mockResolvedValue({
+      value: {
+        views: 1,
+        sessions: 1,
+        visitors: 1,
+        bounces: 0,
+        totalDurationMs: 0,
+        durationViews: 0,
+      },
+      source: "raw",
+      approximateVisitors: false,
+    }),
+    readTrend: vi.fn(),
+  };
+}
+
+function overviewInvocation(
+  overviewReader: OverviewReader,
+  options: {
+    readonly context?: QueryContext;
+    readonly cache?: {
+      readonly key: string;
+      readonly policy: { readonly ttlMs: number; readonly maxEntries: number };
+    };
+  } = {},
+) {
+  const context =
+    options.context ?? siteQueryContext("site-1", "private-dashboard");
+  const query: OverviewQuery = {
+    context,
+    time,
+    filters: EMPTY_FILTER_DOCUMENT,
+  };
+  return {
+    kind: "typed-query" as const,
+    operation: "overview" as const,
+    query,
+    providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+      execute: async (input) => {
+        const result = await overviewReader.readOverview(input as never);
+        return {
+          value: { current: result.value },
+          source: result.source,
+          approximateVisitors: result.approximateVisitors,
+        };
+      },
+    }),
+    ...(options.cache ? { cache: options.cache } : {}),
+  };
+}
+
+function trendInvocation(overviewReader: OverviewReader) {
+  const context = siteQueryContext("site-1", "private-dashboard");
+  const query = {
+    context,
+    time,
+    filters: EMPTY_FILTER_DOCUMENT,
+    interval: "hour" as const,
+  };
+  return {
+    kind: "typed-query" as const,
+    operation: "trend" as const,
+    query,
+    providerRegistry: new AnalyticsProviderRegistry().register("trend", {
+      execute: async (input) => {
+        const result = await overviewReader.readTrend(input as typeof query);
+        return {
+          value: { interval: query.interval, points: result.value },
+          source: result.source,
+          approximateVisitors: result.approximateVisitors,
+        };
+      },
+    }),
+  };
+}
+
+function invocation<T>(
+  operation: QueryOperation,
+  run: () => Promise<T>,
+  context = siteQueryContext("site-1", "private-dashboard"),
+) {
+  return {
+    kind: "typed-query" as const,
+    operation,
+    query: { context, time, filters: EMPTY_FILTER_DOCUMENT } as never,
+    providerRegistry: new AnalyticsProviderRegistry().register(operation, {
+      execute: async () => ({ value: await run() }),
+    } as never),
+  };
+}
+
+describe("TypedQueryApplicationService", () => {
+  it("keeps one canonical provider map and resolves only registered operations", async () => {
+    const provider = typedQueryProviderFor("overview", async () => ({
+      value: overviewValue(1),
+    }));
+    const registry = new AnalyticsProviderRegistry().register(
+      "overview",
+      provider,
+    );
+    expect(registry.resolve("overview")).toBe(provider);
+    expect(registry.resolve("trend")).toBeUndefined();
+
+    const factoryRegistry = createTypedQueryProviderRegistry(
+      "overview",
+      async () => ({ value: overviewValue(2) }),
+    );
+    await expect(
+      factoryRegistry.resolve("overview")?.execute({} as never),
+    ).resolves.toMatchObject({ value: { current: { views: 2 } } });
+  });
+
+  it("executes a canonical typed query through the registry", async () => {
+    const service = new TypedQueryApplicationService();
+    const context = siteQueryContext("site-1", "private-dashboard");
+    const run = vi.fn().mockResolvedValue({
+      value: overviewValue(3),
+      source: "rollup",
+      approximateVisitors: true,
+    });
+    const providerRegistry = new AnalyticsProviderRegistry().register(
+      "overview",
+      { execute: run },
+    );
+
+    await expect(
+      service.execute({
+        kind: "typed-query",
+        operation: "overview",
+        query: {
+          context,
+          time,
+          filters: EMPTY_FILTER_DOCUMENT,
+        } as OverviewQuery,
+        providerRegistry,
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      data: overviewValue(3),
+      meta: {
+        time,
+        source: "rollup",
+        approximateVisitors: true,
+        filterScope: { requested: "auto", resolved: "event" },
+      },
+    });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("passes Core expressions through the typed provider boundary", async () => {
+    const run = vi.fn().mockResolvedValue({ value: overviewValue(99) });
+    const result = await new TypedQueryApplicationService().execute({
+      kind: "typed-query",
+      operation: "overview",
+      query: {
+        context: siteQueryContext("site-1", "private-dashboard"),
+        time,
+        filters: parseFilterDsl("count(EVENT) gte 1", analyticsFilterRegistry),
+      } as OverviewQuery,
+      providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+        execute: run,
+      }),
+    });
+
+    expect(result).toMatchObject({ ok: true, data: overviewValue(99) });
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("returns an internal error when a result provider is missing", async () => {
+    await expect(
+      new TypedQueryApplicationService().execute({
+        kind: "typed-query",
+        operation: "overview",
+        query: {
+          context: siteQueryContext("site-1", "private-dashboard"),
+          time,
+          filters: EMPTY_FILTER_DOCUMENT,
+        } as OverviewQuery,
+        providerRegistry: new AnalyticsProviderRegistry(),
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "internal", operation: "overview" },
+    });
+  });
+
+  it("executes an already-enveloped result provider", async () => {
+    const result = {
+      ok: true as const,
+      data: overviewValue(9),
+      meta: {
+        time,
+        source: "raw" as const,
+        approximateVisitors: false,
+        filterScope: {
+          requested: "auto" as const,
+          resolved: "event" as const,
+        },
+      },
+    };
+    const providerRegistry = new AnalyticsProviderRegistry().register(
+      "overview",
+      {
+        execute: async () => ({
+          value: result.data,
+          source: result.meta.source,
+          approximateVisitors: result.meta.approximateVisitors,
+        }),
+      },
+    );
+
+    await expect(
+      new TypedQueryApplicationService().execute({
+        kind: "typed-query",
+        operation: "overview",
+        query: {
+          context: siteQueryContext("site-1", "private-dashboard"),
+          time,
+        } as OverviewQuery,
+        providerRegistry,
+      }),
+    ).resolves.toEqual(result);
+  });
+
+  it("checks the deadline after an enveloped provider finishes", async () => {
+    const now = vi.fn().mockReturnValueOnce(0).mockReturnValueOnce(1);
+    const providerRegistry = new AnalyticsProviderRegistry().register(
+      "overview",
+      {
+        execute: async () => ({
+          value: overviewValue(1),
+          source: "raw" as const,
+          approximateVisitors: false,
+        }),
+      },
+    );
+
+    await expect(
+      new TypedQueryApplicationService().execute(
+        {
+          kind: "typed-query",
+          operation: "overview",
+          query: {
+            context: siteQueryContext("site-1", "private-dashboard"),
+            time,
+          } as OverviewQuery,
+          providerRegistry,
+        },
+        { deadlineMs: 1, now },
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "deadline-exceeded" },
+    });
+  });
+
+  it("requires a canonical time before producing a value envelope", async () => {
+    const providerRegistry = new AnalyticsProviderRegistry().register("pages", {
+      execute: async () => ({
+        value: {
+          items: [],
+          pagination: {
+            limit: 20,
+            returned: 0,
+            hasMore: false,
+            nextCursor: null,
+          },
+        },
+      }),
+    });
+
+    await expect(
+      new TypedQueryApplicationService().execute({
+        kind: "typed-query",
+        operation: "pages",
+        query: {
+          context: siteQueryContext("site-1", "private-dashboard"),
+        } as never,
+        providerRegistry,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: {
+        kind: "invalid-input",
+        issues: [{ path: "scope", code: "scoped_query_requires_time" }],
+      },
+    });
+  });
+
+  it("rejects an unscoped provider result without canonical time", async () => {
+    await expect(
+      new TypedQueryApplicationService().execute({
+        kind: "typed-query",
+        operation: "realtime",
+        query: {
+          context: siteQueryContext("site-1", "private-dashboard"),
+        } as never,
+        providerRegistry: new AnalyticsProviderRegistry().register("realtime", {
+          execute: async () => ({ value: { activeNow: 0 } }),
+        }),
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "internal", operation: "realtime" },
+    });
+  });
+
+  it("keeps provider failures inside the AnalyticsResult envelope", async () => {
+    const failure = new Error("provider-down");
+    await expect(
+      new TypedQueryApplicationService().execute(
+        invocation("pages", () => Promise.reject(failure)),
+        {},
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "internal", operation: "pages" },
+    });
+  });
+
+  it("reports provider failures to the injected application error handler", async () => {
+    const failure = new Error("provider-down");
+    const onApplicationError = vi.fn();
+    const service = new TypedQueryApplicationService(
+      undefined,
+      undefined,
+      onApplicationError,
+    );
+
+    await expect(
+      service.execute(invocation("pages", () => Promise.reject(failure))),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "internal", operation: "pages" },
+    });
+    expect(onApplicationError).toHaveBeenCalledWith(failure, "pages");
+  });
+
+  it("keeps provider errors stable if the application error handler throws", async () => {
+    const failure = new Error("provider-down");
+    const onApplicationError = vi.fn(() => {
+      throw new Error("logging failed");
+    });
+    const service = new TypedQueryApplicationService(
+      undefined,
+      undefined,
+      onApplicationError,
+    );
+
+    await expect(
+      service.execute(invocation("pages", () => Promise.reject(failure))),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "internal", operation: "pages" },
+    });
+    expect(onApplicationError).toHaveBeenCalledWith(failure, "pages");
+  });
+
+  it("rejects policy-denied operations before provider execution", async () => {
+    const run = vi.fn().mockResolvedValue("unreachable");
+    const context = {
+      ...siteQueryContext("site-1", "private-dashboard"),
+      policy: {
+        ...siteQueryContext("site-1", "private-dashboard").policy,
+        allowedOperations: new Set<QueryOperation>(),
+      },
+    };
+
+    await expect(
+      new TypedQueryApplicationService().execute(
+        invocation("pages", run, context),
+        {},
+      ),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "capability-denied", capability: "pages" },
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("rejects abort, deadline, and cost before provider execution", async () => {
+    const service = new TypedQueryApplicationService(undefined, {
+      rangeUnitMs: 1,
+      maxCost: 2,
+      providerWeights: { d1: 1, rollup: 1, realtime: 1, mixed: 1 },
+    });
+    const run = vi.fn().mockResolvedValue("unreachable");
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      service.execute(invocation("pages", run), { signal: controller.signal }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "request-cancelled" },
+    });
+    await expect(
+      service.execute(invocation("pages", run), {
+        deadlineMs: 10,
+        now: () => 10,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "deadline-exceeded" },
+    });
+    await expect(
+      service.execute(invocation("pages", run), {
+        cost: { rangeMs: 2, provider: "d1" },
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "query-cost-exceeded", cost: 2 },
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("records lifecycle events without allowing telemetry to alter results", async () => {
+    const events: Array<{ phase: string; operation: string }> = [];
+    const service = new TypedQueryApplicationService();
+    await service.execute(
+      invocation("pages", () => Promise.resolve(1)),
+      {
+        operation: "pages",
+        onEvent: (event) => {
+          events.push(event);
+          throw new Error("telemetry failure");
+        },
+      },
+    );
+
+    expect(events.map((event) => `${event.operation}:${event.phase}`)).toEqual([
+      "pages:start",
+      "pages:success",
+    ]);
+  });
+
+  it("attaches the canonical scope plan to invocation diagnostics", async () => {
+    const events: AnalyticsQueryEvent[] = [];
+    await new TypedQueryApplicationService().execute(
+      overviewInvocation(reader()),
+      { operation: "overview", onEvent: (event) => events.push(event) },
+    );
+
+    expect(events.at(-1)).toMatchObject({
+      phase: "success",
+      requestedScope: "auto",
+      resolvedScope: "event",
+      requiredSources: [],
+      requiresRawSource: false,
+    });
+  });
+
+  it("accounts for nested entity membership and payload source cost", async () => {
+    const overviewReader = reader();
+    const filters = parseFilterDsl(
+      "session.durationMs gt 10 AND session.views gt 1",
+      analyticsFilterRegistry,
+    );
+    const context = siteQueryContext("site-1", "private-dashboard");
+    const result = await new TypedQueryApplicationService().execute(
+      {
+        kind: "typed-query",
+        operation: "overview",
+        query: {
+          context,
+          time,
+          filters,
+        } as OverviewQuery,
+        providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+          execute: async (input) => {
+            const result = await overviewReader.readOverview(input as never);
+            return {
+              value: { current: result.value },
+              source: result.source,
+              approximateVisitors: result.approximateVisitors,
+            };
+          },
+        }),
+      },
+      { cost: { rangeMs: 1, provider: "d1" } },
+    );
+
+    expect(result).toMatchObject({ ok: true, data: { current: { views: 1 } } });
+    expect(overviewReader.readOverview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopePlan: expect.objectContaining({ mode: "entity" }),
+      }),
+    );
+
+    const payloadFilters = parseFilterDsl(
+      'event.payload("/plan") eq "pro"',
+      analyticsFilterRegistry,
+    );
+    const payloadResult = await new TypedQueryApplicationService().execute(
+      {
+        kind: "typed-query",
+        operation: "overview",
+        query: { context, time, filters: payloadFilters } as OverviewQuery,
+        providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+          execute: async (input) => {
+            const result = await overviewReader.readOverview(input as never);
+            return {
+              value: { current: result.value },
+              source: result.source,
+              approximateVisitors: result.approximateVisitors,
+            };
+          },
+        }),
+      },
+      { cost: { rangeMs: 1, provider: "d1" } },
+    );
+    expect(payloadResult).toMatchObject({
+      ok: true,
+      data: { current: { views: 1 } },
+    });
+
+    const notFilters = parseFilterDsl(
+      "NOT session.durationMs gt 10",
+      analyticsFilterRegistry,
+    );
+    const notResult = await new TypedQueryApplicationService().execute(
+      {
+        kind: "typed-query",
+        operation: "overview",
+        query: { context, time, filters: notFilters } as OverviewQuery,
+        providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+          execute: async (input) => {
+            const result = await overviewReader.readOverview(input as never);
+            return {
+              value: { current: result.value },
+              source: result.source,
+              approximateVisitors: result.approximateVisitors,
+            };
+          },
+        }),
+      },
+      { cost: { rangeMs: 1, provider: "d1" } },
+    );
+    expect(notResult).toMatchObject({
+      ok: true,
+      data: { current: { views: 1 } },
+    });
+  });
+
+  it("walks Relation steps when estimating the complexity budget", async () => {
+    const overviewReader = reader();
+    const relationFilters = parseFilterDsl(
+      'VISITOR { sequence([EVENT { $.name eq "signup" }, PAGE { $.path eq "/pricing" }]) exists } exists',
+      analyticsFilterRegistry,
+    );
+    const result = await new TypedQueryApplicationService().execute(
+      {
+        kind: "typed-query",
+        operation: "overview",
+        query: {
+          context: siteQueryContext("site-1", "private-dashboard"),
+          time,
+          filters: relationFilters,
+          scopePreference: "visitor",
+        } as OverviewQuery,
+        providerRegistry: new AnalyticsProviderRegistry().register("overview", {
+          execute: async (input) => {
+            const overview = await overviewReader.readOverview(input as never);
+            return {
+              value: { current: overview.value },
+              source: overview.source,
+              approximateVisitors: overview.approximateVisitors,
+            };
+          },
+        }),
+      },
+      { cost: { rangeMs: 1, provider: "d1" } },
+    );
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      ok: true,
+      data: { current: { views: 1 } },
+    });
+    expect(overviewReader.readOverview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopePlan: expect.objectContaining({
+          scope: "visitor",
+          mode: "entity",
+          membership: {
+            kind: "entity",
+            expression: null,
+            entityKind: "visitor",
+          },
+        }),
+      }),
+    );
+  });
+
+  it("supports current-time query shapes and maps provider cursor failures", async () => {
+    const context = siteQueryContext("site-1", "private-dashboard");
+    const current = await new TypedQueryApplicationService().execute({
+      kind: "typed-query",
+      operation: "realtime",
+      query: {
+        context,
+        filters: EMPTY_FILTER_DOCUMENT,
+        current: { time, filters: EMPTY_FILTER_DOCUMENT } as never,
+      } as never,
+      providerRegistry: new AnalyticsProviderRegistry().register("realtime", {
+        execute: async () => ({ value: { activeNow: 1 } }),
+      }),
+    });
+    expect(current).toMatchObject({ ok: true, data: { activeNow: 1 } });
+
+    const cursorFailure = await new TypedQueryApplicationService().execute({
+      kind: "typed-query",
+      operation: "pages",
+      query: { context, time, filters: EMPTY_FILTER_DOCUMENT } as never,
+      providerRegistry: new AnalyticsProviderRegistry().register("pages", {
+        execute: async () => {
+          throw new InvalidCursorError("pages");
+        },
+      }),
+    });
+    expect(cursorFailure).toEqual({
+      ok: false,
+      error: { kind: "invalid-cursor", cursorKind: "pages" },
+    });
+  });
+
+  it("executes overview and timeseries through ordinary registry entries", async () => {
+    const overviewReader = reader();
+    vi.mocked(overviewReader.readTrend).mockResolvedValue({
+      value: [],
+      source: "raw",
+      approximateVisitors: false,
+    });
+    const service = new TypedQueryApplicationService();
+
+    const overview = await service.execute(overviewInvocation(overviewReader));
+    const trend = await service.execute(trendInvocation(overviewReader));
+
+    expect(overview).toMatchObject({
+      ok: true,
+      data: { current: { views: 1 } },
+    });
+    expect(trend).toMatchObject({
+      ok: true,
+      data: { interval: "hour", points: [] },
+    });
+    expect(overviewReader.readOverview).toHaveBeenCalledOnce();
+    expect(overviewReader.readTrend).toHaveBeenCalledOnce();
+  });
+
+  it("returns cancellation and deadline after provider completion", async () => {
+    const service = new TypedQueryApplicationService();
+    const overviewReader = reader();
+    const cancelled = new AbortController();
+    overviewReader.readOverview = vi.fn(async () => {
+      cancelled.abort();
+      return {
+        value: {
+          views: 1,
+          sessions: 1,
+          visitors: 1,
+          bounces: 0,
+          totalDurationMs: 0,
+          durationViews: 0,
+        },
+        source: "raw" as const,
+        approximateVisitors: false,
+      };
+    });
+
+    await expect(
+      service.execute(overviewInvocation(overviewReader), {
+        signal: cancelled.signal,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "request-cancelled" },
+    });
+    await expect(
+      service.execute(overviewInvocation(reader()), {
+        deadlineMs: 2,
+        now: () => 3,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { kind: "deadline-exceeded" },
+    });
+  });
+
+  it("caches successful provider values behind an opaque key", async () => {
+    const overviewReader = reader();
+    const service = new TypedQueryApplicationService(
+      new OperationResultCache(),
+    );
+    const cache = {
+      key: "__query_cache/v1/overview/opaque",
+      policy: { ttlMs: 1_000, maxEntries: 4 },
+    } as const;
+
+    await service.execute(overviewInvocation(overviewReader, { cache }));
+    await service.execute(overviewInvocation(overviewReader, { cache }));
+
+    expect(overviewReader.readOverview).toHaveBeenCalledOnce();
+  });
+
+  it("does not cache policy-denied results", async () => {
+    const overviewReader = reader();
+    const service = new TypedQueryApplicationService(
+      new OperationResultCache(),
+    );
+    const context = {
+      ...siteQueryContext("site-1", "private-dashboard"),
+      policy: {
+        ...siteQueryContext("site-1", "private-dashboard").policy,
+        allowedOperations: new Set<QueryOperation>(),
+      },
+    } as const;
+
+    const result = await service.execute(
+      overviewInvocation(overviewReader, {
+        context,
+        cache: {
+          key: "__query_cache/v1/overview/denied",
+          policy: { ttlMs: 1_000, maxEntries: 4 },
+        },
+      }),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { kind: "capability-denied", capability: "overview" },
+    });
+    expect(overviewReader.readOverview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a weighted cost at the policy ceiling", async () => {
+    const overviewReader = reader();
+    const service = new TypedQueryApplicationService(undefined, {
+      rangeUnitMs: 1,
+      maxCost: 10,
+      providerWeights: { d1: 1, rollup: 1, realtime: 1, mixed: 1 },
+    });
+    const result = await service.execute(overviewInvocation(overviewReader), {
+      cost: { rangeMs: 10, provider: "d1" },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "query-cost-exceeded", cost: 10 },
+    });
+    expect(overviewReader.readOverview).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,98 @@
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+@import "@insightflare/ui/styles.css";
+@import "@insightflare/product-ui/styles.css";
+@source "../";
+
+@theme inline {
+  --font-mono:
+    "JetBrains Mono Variable", "JetBrains Mono", "Cascadia Mono", Consolas,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-monospace,
+    monospace;
+}
+
+@layer base {
+  :root:not([data-scrollbar-mode="native"]),
+  :root:not([data-scrollbar-mode="native"]) * {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  :root:not([data-scrollbar-mode="native"])::-webkit-scrollbar,
+  :root:not([data-scrollbar-mode="native"]) *::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  body {
+    font-family: var(--font-mono);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body {
+    animation: none;
+  }
+
+  [data-page-transition] {
+    animation: none !important;
+    transform: none !important;
+    opacity: 1 !important;
+  }
+}
+
+[data-page-transition] {
+  --page-transition-enter-duration: 320ms;
+  --page-transition-exit-duration: 280ms;
+  min-height: 100%;
+  will-change: opacity, transform;
+}
+
+[data-page-transition][data-transition="enter"] {
+  animation: page-transition-enter var(--page-transition-enter-duration)
+    cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+[data-page-transition][data-transition="exit"] {
+  animation: page-transition-exit var(--page-transition-exit-duration)
+    cubic-bezier(0.4, 0, 1, 1) both;
+  pointer-events: none;
+}
+
+/* Table-row opacity is not consistently composited by browsers; fade cells instead. */
+@keyframes analytics-data-row-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+[data-analytics-row-enter] > td {
+  animation: analytics-data-row-fade-in 480ms ease-out both;
+  animation-delay: var(--analytics-data-row-delay, 0ms);
+}
+
+@keyframes page-transition-enter {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes page-transition-exit {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(28px);
+  }
+}
